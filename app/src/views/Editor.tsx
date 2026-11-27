@@ -1,0 +1,240 @@
+import { useEffect, useState } from 'react';
+import { ConfirmButton } from '../components/ConfirmButton.tsx';
+import { useEditorDraft } from './editor/useEditorDraft.ts';
+import { prepareEditorSave, mergeEditorSave } from './editor/save.ts';
+
+import { ArrowUpRight, ReceiptText } from 'lucide-react';
+import type { AssistantConfigView } from '../../../shared/deepseek.ts';
+import { cachedAssistantConfigured, compressImage, handoff, loadAssistantConfigured } from '../handoff.ts';
+import { t } from '../../../shared/i18n.ts';
+import { filesOf } from '../../../shared/files.ts';
+import { relinkFile } from '../files.ts';
+import type { AppState, Subscription } from '../../../shared/types.ts';
+import { ask, Sheet } from '../components/overlays.tsx';
+import { useSubmit } from '../components/inputs.tsx';
+
+import { pauseDay } from '../../../shared/billing.ts';
+import { affectedPriceCharges } from '../../../shared/phases.ts';
+import { ChangePanel } from '../components/ChangePanel.tsx';
+
+import { currentRoute } from '../router.ts';
+import { api, deleteSub, getState, savePerson, saveSettings, saveSub } from '../store.ts';
+import { run } from '../toast.ts';
+import { linkPerson } from './person-fields.tsx';
+
+import { writeDraft } from './editor/draft.ts';
+import { Form } from './editor/Form.tsx';
+import { applyChildLink, buildLinkedChildSub, unlinkChildSub, validateExistingChildLink } from './editor/linked.ts';
+
+export function Editor({ sub, state, today, onClose }: { sub: Subscription; state: AppState; today: string; onClose: () => void }) {
+  const { isNew, key, restored, priceValid, setPriceValid, historyReset, f, setF, up, stop, setStop, linked, setLinked, basePrice, dirty, close, reset } =
+    useEditorDraft({
+      sub,
+      state,
+      today,
+      onClose,
+    });
+  const [aiReady, setAiReady] = useState<boolean | null>(cachedAssistantConfigured);
+  useEffect(() => {
+    if (!isNew) return;
+    let dead = false;
+    void loadAssistantConfigured(() => api<AssistantConfigView>('/api/assistant/config')).then((v) => {
+      if (!dead && v !== null) setAiReady(v);
+    });
+    return () => {
+      dead = true;
+    };
+  }, [isNew]);
+
+  /** 交给 AI 助手：带上已填名称，并记录当前页面以便一键返回；返回时以原始表单（含合租/代付模板）打开，已填内容由本地草稿恢复 */
+  const toAssistant = (images: string[] = []) => {
+    const returnTo = { route: currentRoute() || 'overview', draft: sub };
+    close();
+    handoff(f.name.trim() ? `${f.name.trim()}\n` : '', images, returnTo);
+  };
+
+  const [busy, submit] = useSubmit();
+  const save = async () => {
+    if (!priceValid) return;
+    let out: Subscription;
+    try {
+      out = prepareEditorSave(sub, f, today, isNew, basePrice, stop, state.subscriptions);
+    } catch (e) {
+      await run(async () => {
+        throw e;
+      });
+      return;
+    }
+    const affected = !isNew && affectedPriceCharges(sub, out, today);
+    if (affected && !(await ask(t('editor.history.repriceCharges', { count: affected })))) return;
+    await run(
+      async () => {
+        if (out.status === 'paused' && !out.pausedAt) out.pausedAt = pauseDay(out, today);
+        if (out.status !== 'paused') delete out.pausedAt;
+        // 代付对象：新的人先建档，已有的人改了资料等订阅保存后再同步
+        const px = out.proxy;
+        const link: Awaited<ReturnType<typeof linkPerson>> = px
+          ? await linkPerson(state, px.personId, px.forName, px.contact ? (px.contactVia ?? 'Telegram') : undefined, px.contact)
+          : {};
+        if (px) out = { ...out, proxy: { ...px, forName: px.forName.trim(), personId: link.id } };
+        const latest = getState().subscriptions.find((x) => x.id === sub.id);
+        const final = mergeEditorSave(sub, out, latest, isNew);
+        // 关联已有子订阅先做历史预检，有冲突时在写入前拦住
+        const curSubs = getState().subscriptions;
+        for (const item of linked.upsert) {
+          if (item.kind !== 'existing') continue;
+          const target = curSubs.find((x) => x.id === item.subId);
+          if (!target) continue;
+          const err = validateExistingChildLink(target, final, item.follow, curSubs, today);
+          if (err) throw new Error(err);
+        }
+        // 先解除要解绑的子订阅，再保存主订阅，最后写入新增/新挂上的子订阅
+        const doneUnlink = new Set<string>();
+        const doneUpsert = new Set<string>();
+        try {
+          for (const childId of linked.unlink) {
+            const cur = getState().subscriptions.find((x) => x.id === childId);
+            if (cur) {
+              const next = unlinkChildSub(cur, final.id, today);
+              if (next !== cur) await saveSub(next);
+            }
+            doneUnlink.add(childId);
+          }
+          await saveSub(final);
+          if (link.after) await savePerson(link.after);
+          for (const item of linked.upsert) {
+            if (item.kind === 'new') {
+              await saveSub(buildLinkedChildSub(item, final, today));
+              doneUpsert.add(item.id);
+            } else {
+              const cur = getState().subscriptions.find((x) => x.id === item.subId);
+              if (cur) await saveSub(applyChildLink(cur, final.id, item.follow, today));
+              doneUpsert.add(item.subId);
+            }
+          }
+        } catch (e) {
+          if (doneUnlink.size || doneUpsert.size) {
+            setLinked((prev) => ({
+              unlink: prev.unlink.filter((id) => !doneUnlink.has(id)),
+              upsert: prev.upsert.filter((x) => !doneUpsert.has(x.kind === 'new' ? x.id : x.subId)),
+            }));
+          }
+          throw e;
+        }
+        writeDraft(key, undefined);
+        onClose();
+      },
+      t(isNew ? 'editor.toast.added' : 'editor.toast.saved'),
+    );
+  };
+  const subFiles = isNew ? [] : filesOf(state.files ?? [], sub.id);
+
+  return (
+    <Sheet
+      narrow
+      title={isNew ? t('editor.addTitle') : t('editor.editTitle', { name: sub.name })}
+      onClose={close}
+      foot={
+        <>
+          {!isNew && (
+            <ConfirmButton
+              hint={[t('editor.confirmDelete', { name: sub.name }), subFiles.length ? t('files.keep', { count: subFiles.length }) : '']
+                .filter(Boolean)
+                .join('\n')}
+              onConfirm={() => {
+                // 删除会把它移出公开页隐藏列表、它的文件变成「已删除」；撤销时一并放回、文件挂回原处
+                const hidden = getState().settings.publicHidden?.includes(sub.id);
+                const anchored = filesOf(getState().files ?? [], sub.id);
+                const restore = async () => {
+                  await saveSub(sub);
+                  const list = getState().settings.publicHidden ?? [];
+                  if (hidden && !list.includes(sub.id)) await saveSettings({ publicHidden: [...list, sub.id] });
+                  // 期间删掉的文件挂不回去，不影响其余的
+                  for (const f of anchored)
+                    await relinkFile(f, { subId: sub.id, kind: f.kind ?? 'sub', date: f.kind === 'sub' ? null : (f.date ?? null) }).catch(() => {});
+                };
+                run(
+                  async () => {
+                    await deleteSub(sub.id);
+                    writeDraft(key, undefined);
+                    onClose();
+                  },
+                  // 删了还能撤销：把删掉的订阅原样存回去
+                  { text: t('editor.toast.deleted'), action: { label: t('ui.undo'), onClick: () => void run(restore, t('ui.restored')) } },
+                );
+              }}
+            >
+              {t('common.delete')}
+            </ConfirmButton>
+          )}
+          {dirty ? (
+            <button className="btn plain" onClick={reset}>
+              {isNew ? t('editor.clearForm') : t('editor.revert')}
+            </button>
+          ) : null}
+          <span className="grow" />
+          <button
+            className="btn"
+            onClick={() => {
+              writeDraft(key, undefined);
+              onClose();
+            }}
+          >
+            {t('common.cancel')}
+          </button>
+          <button className="btn primary" disabled={busy || !f.name.trim() || !priceValid} onClick={() => void submit(save)}>
+            {isNew ? t('common.add') : t('common.done')}
+          </button>
+        </>
+      }
+    >
+      {restored && dirty && <div className="ed-draft">{t('editor.draftRestored')}</div>}
+      {isNew &&
+        aiReady !== null &&
+        (aiReady ? (
+          <button type="button" className="ed-ai" onClick={() => toAssistant()}>
+            <span className="ed-ai-ico">
+              <ReceiptText size={18} />
+            </span>
+            <span className="ed-ai-text">
+              <b>{t('editor.ai.title')}</b>
+            </span>
+            <span className="ed-ai-go">
+              {t('editor.ai.open')}
+              <ArrowUpRight size={14} aria-hidden="true" />
+            </span>
+          </button>
+        ) : (
+          <button type="button" className="ed-ai muted" onClick={() => toAssistant()}>
+            <ReceiptText size={15} className="ed-ai-muted-ico" aria-hidden="true" />
+            <span className="ed-ai-muted-text">{t('editor.ai.setup')}</span>
+            <ArrowUpRight size={14} className="ed-ai-arrow" aria-hidden="true" />
+          </button>
+        ))}
+      <div
+        onPaste={(e) => {
+          // 新建时在表单里粘贴截图：交给 AI 助手识别
+          const files = isNew ? [...e.clipboardData.files].filter((x) => x.type.startsWith('image/')) : [];
+          if (!files.length) return;
+          e.preventDefault();
+          void Promise.all(files.slice(0, 8).map(compressImage)).then(toAssistant, () => toAssistant());
+        }}
+      >
+        <Form
+          key={historyReset}
+          isNew={isNew}
+          f={f}
+          setF={setF}
+          up={up}
+          state={state}
+          today={today}
+          stop={stop}
+          setStop={setStop}
+          linked={linked}
+          setLinked={setLinked}
+          history={!isNew && <ChangePanel key={historyReset} f={f} setF={setF} state={state} today={today} onPriceValidity={setPriceValid} />}
+        />
+      </div>
+    </Sheet>
+  );
+}
